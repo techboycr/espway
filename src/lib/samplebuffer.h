@@ -1,6 +1,6 @@
 /*
- * Library for calculating orientation from an inertial measurement unit
- * Copyright (C) 2017  Sakari Kapanen
+ * Ringbuffer with median of samples calculation for small sample counts
+ * Copyright (C) 2018  Sakari Kapanen
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -18,29 +18,24 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
-#include "q16.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "vector3d.h"
+#include <stddef.h>
 
 typedef struct {
-  q16 Kp;
-  q16 Ki;
-  q16 dt;
-  vector3d_fix integral;
-  q16 gyro_conversion_factor;
-} mahony_filter_state;
+  size_t sample_count;
+  size_t next_index;
+  size_t middle1;
+  size_t middle2;
+  int32_t buffer[];
+} samplebuffer_t;
 
-void mahony_filter_init(mahony_filter_state *state, float Kp, float Ki,
-    float gyro_factor, float dt);
+// Allocate and initialize ring buffer. Free it with free()
+samplebuffer_t* samplebuffer_init(size_t sample_count);
+void samplebuffer_add_sample(samplebuffer_t* buffer, int32_t value);
+void samplebuffer_reset(samplebuffer_t* buffer, int32_t value);
 
-void mahony_filter_update(mahony_filter_state *params,
-    const int16_t *raw_accel, const int16_t *raw_gyro, vector3d_fix *gravity);
-
-#ifdef __cplusplus
-}
-#endif
+// Performs an insertion sort of the samples and calculates the median
+// from there.
+int32_t samplebuffer_median(samplebuffer_t* buffer);
 

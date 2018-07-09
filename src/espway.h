@@ -11,18 +11,11 @@
 
 #define SAMPLE_TIME IMU_SAMPLE_TIME
 
-#define FALL_LOWER_BOUND FLT_TO_Q16(STABLE_ANGLE - FALL_LIMIT)
-#define FALL_UPPER_BOUND FLT_TO_Q16(STABLE_ANGLE + FALL_LIMIT)
-#define RECOVER_LOWER_BOUND FLT_TO_Q16(STABLE_ANGLE - RECOVER_LIMIT)
-#define RECOVER_UPPER_BOUND FLT_TO_Q16(STABLE_ANGLE + RECOVER_LIMIT)
-#define ROLL_LOWER_BOUND FLT_TO_Q16(-ROLL_LIMIT)
-#define ROLL_UPPER_BOUND FLT_TO_Q16(ROLL_LIMIT)
-
 typedef enum {
   STEERING = 0,
 
-  REQ_GRAVITY = 1,
-  RES_GRAVITY = 2,
+  REQ_ORIENTATION = 1,
+  RES_ORIENTATION = 2,
 
   BATTERY = 3,
   BATTERY_CUTOFF = 4,
@@ -61,27 +54,33 @@ typedef enum {
   VEL
 } pid_controller_index;
 
-extern TaskHandle_t xSteeringWatcher;
+typedef struct {
+  q16 sin_pitch;
+  q16 sin_roll;
+} orientation;
+
+typedef enum { STABILIZING_ORIENTATION, RUNNING, FALLEN, WOUND_UP } state;
 
 extern espway_config my_config;
 
 extern SemaphoreHandle_t pid_mutex;
 extern pidsettings pid_settings_arr[2];
 
-extern SemaphoreHandle_t orientation_mutex;
-extern vector3d_fix gravity;
-
-extern q16 target_speed;
-extern q16 steering_bias;
-
-void pretty_print_config(void);
-void apply_config_params(void);
-bool save_flash_config(void);
-bool clear_flash_config(void);
-void load_config(void);
-void load_hardcoded_config(void);
+void pretty_print_config();
+void apply_config_params();
+bool save_flash_config();
+bool clear_flash_config();
+void load_config();
+void load_hardcoded_config();
 void update_pid_controller(pid_controller_index idx, q16 p, q16 i, q16 d);
 
 void httpd_task(void *pvParameters);
 
-void battery_cutoff(void);
+void battery_cutoff();
+
+state get_state();
+void set_steering(q16 new_target_speed, q16 new_turning_bias);
+orientation get_orientation();
+
+void maze_solver_task(void *pvParameters);
+

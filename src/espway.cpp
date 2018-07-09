@@ -16,6 +16,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+extern "C" {
 #include <string.h>
 #include <espressif/esp_common.h>
 #include <user_exception.h>
@@ -23,13 +24,15 @@
 #include <esp8266.h>
 #include <esp/uart.h>
 
-#include "lib/imu_math.h"
-#include "lib/imu_hal.h"
 #include "lib/eyes.h"
-#include "lib/motors.h"
 #include "lib/delta_sigma.h"
+#include "lib/imu_hal.h"
+#include "lib/imu_math.h"
+#include "lib/motors.h"
+}
 #include "espway.h"
 #include "espway_config.h"
+#include "lib/locks.h"
 
 #ifndef M_PI
 #define M_PI (3.14159265358979323846)
@@ -53,49 +56,71 @@
 #define PRIO_COMMUNICATION  2
 #define PRIO_MAIN_LOOP      (TCPIP_THREAD_PRIO + 1)
 
-const color_t RED    = { .color = 0xb40000 };
-const color_t YELLOW = { .color = 0xb4b400 };
-const color_t GREEN  = { .color = 0x00b400 };
-const color_t BLUE   = { .color = 0x0000b4 };
-const color_t LILA   = { .color = 0xb400b4 };
-const color_t BLACK  = { .color = 0x000000 };
-
 typedef enum { LOG_FREQ, LOG_RAW, LOG_PITCH, LOG_NONE } logmode;
-typedef enum { STABILIZING_ORIENTATION, RUNNING, FALLEN, WOUND_UP } state;
 
-TaskHandle_t xCalculationTask;
-TaskHandle_t xSteeringWatcher;
-TaskHandle_t xIMUWatcher;
+static TaskHandle_t xCalculationTask = NULL;
+static TaskHandle_t xSteeringWatcher = NULL;
+static TaskHandle_t xIMUWatcher = NULL;
 
-mahony_filter_state imuparams;
-pidstate vel_pid_state;
-pidstate angle_pid_state;
+static mahony_filter_state imuparams;
+static pidstate vel_pid_state;
+static pidstate angle_pid_state;
 
 SemaphoreHandle_t pid_mutex;
 pidsettings pid_settings_arr[2];
 
-q16 target_speed = 0;
-q16 steering_bias = 0;
+static SemaphoreHandle_t steering_mutex;
+static q16 target_speed = 0;
+static q16 steering_bias = 0;
 
-SemaphoreHandle_t orientation_mutex;
-vector3d_fix gravity = { 0, 0, Q16_ONE };
+static SemaphoreHandle_t orientation_mutex;
+static vector3d_fix gravity = {{ 0, 0, Q16_ONE }};
+static q16 sin_pitch, sin_roll;
 
-void battery_cutoff(void)
+orientation get_orientation()
+{
+  orientation copy_orientation = {};
+  {
+    MutexLock lock(orientation_mutex);
+    copy_orientation.sin_pitch = sin_pitch;
+    copy_orientation.sin_roll = sin_roll;
+  }
+  return copy_orientation;
+}
+
+void set_steering(q16 new_target_speed, q16 new_steering_bias)
+{
+  {
+    MutexLock lock(steering_mutex);
+    target_speed = new_target_speed;
+    steering_bias = new_steering_bias;
+  }
+
+  if (xSteeringWatcher) xTaskNotify(xSteeringWatcher, 0, eNoAction);
+}
+
+void battery_cutoff()
 {
   set_both_eyes(BLACK);
   set_motors(0, 0);
   sdk_system_deep_sleep(UINT32_MAX);
 }
 
+static state my_state;
+state get_state()
+{
+  return my_state;
+}
+
 static void main_loop(void *pvParameters)
 {
-  static int16_t raw_data[6];
+  int16_t raw_data[6];
   uint32_t time_old = 0;
   uint32_t current_time = 0;
   int n = 0;
   q16 travel_speed = 0;
   q16 smoothed_target_speed = 0;
-  state my_state = STABILIZING_ORIENTATION;
+  my_state = STABILIZING_ORIENTATION;
   unsigned long stage_started = 0;
   unsigned long last_wind_up = 0;
 
@@ -104,80 +129,69 @@ static void main_loop(void *pvParameters)
     xTaskNotifyWait(0, 0, NULL, 1);
     int ret = imu_read_raw_data(raw_data);
     if (ret != 0)
-    {
       printf("Reading IMU failed with code %d\n", ret);
-    }
 
     // Update orientation estimate
-    xSemaphoreTake(orientation_mutex, portMAX_DELAY);
-    mahony_filter_update(&imuparams, &raw_data[0], &raw_data[3], &gravity);
-    // Calculate sine of pitch angle from gravity vector
-    q16 sin_pitch = -gravity.z;
-    q16 sin_roll = -gravity.x;
-    xSemaphoreGive(orientation_mutex);
+    {
+      MutexLock lock(orientation_mutex);
+      mahony_filter_update(&imuparams, &raw_data[0], &raw_data[3], &gravity);
+      // Calculate sine of pitch angle from gravity vector
+      sin_pitch = -gravity.data[IMU_FORWARD_AXIS];
+      if (IMU_INVERT_FORWARD_AXIS) sin_pitch = -sin_pitch;
+      sin_roll = -gravity.data[IMU_SIDE_AXIS];
+      if (IMU_INVERT_SIDE_AXIS) sin_roll = -sin_roll;
+    }
 
     // Exponential smoothing of target speed
-    smoothed_target_speed = q16_exponential_smooth(smoothed_target_speed,
-        target_speed, FLT_TO_Q16(TARGET_SPEED_SMOOTHING));
+    q16 motor_bias;
+    {
+      MutexLock lock(orientation_mutex);
+      smoothed_target_speed = q16_exponential_smooth(smoothed_target_speed,
+          target_speed, FLT_TO_Q16(TARGET_SPEED_SMOOTHING));
+      motor_bias = steering_bias;
+    }
 
     current_time = sdk_system_get_time();
 
-    if (my_state == STABILIZING_ORIENTATION)
+    if (my_state == STABILIZING_ORIENTATION &&
+        current_time - stage_started > ORIENTATION_STABILIZE_DURATION_US)
     {
-      if (current_time - stage_started > ORIENTATION_STABILIZE_DURATION_US)
-      {
-        my_state = RUNNING;
-        stage_started = current_time;
-        imuparams.Kp = FLT_TO_Q16(MAHONY_FILTER_KP);
-      }
+      my_state = RUNNING;
+      stage_started = current_time;
+      imuparams.Kp = FLT_TO_Q16(MAHONY_FILTER_KP);
     }
     else if (my_state == RUNNING || my_state == WOUND_UP)
     {
-      if (sin_pitch < FALL_UPPER_BOUND && sin_pitch > FALL_LOWER_BOUND &&
-          sin_roll < ROLL_UPPER_BOUND && sin_roll > ROLL_LOWER_BOUND)
+      if (abs(sin_pitch - STABLE_ANGLE) < FALL_LIMIT &&
+          abs(sin_roll) < ROLL_LIMIT)
       {
         // Perform PID update
-        xSemaphoreTake(pid_mutex, portMAX_DELAY);
-        q16 target_angle = pid_compute(travel_speed, smoothed_target_speed,
-            &pid_settings_arr[VEL], &vel_pid_state);
+        q16 target_angle, motor_speed;
+        {
+          MutexLock lock(pid_mutex);
+          target_angle = pid_compute(travel_speed, smoothed_target_speed,
+              &pid_settings_arr[VEL], &vel_pid_state);
 
-        q16 motor_speed;
+          if (sin_pitch < (target_angle - FLT_TO_Q16(HIGH_PID_LIMIT)))
+            motor_speed = -Q16_ONE;
+          else if (sin_pitch > target_angle + FLT_TO_Q16(HIGH_PID_LIMIT))
+            motor_speed = Q16_ONE;
+          else
+            motor_speed = pid_compute(sin_pitch, target_angle,
+                &pid_settings_arr[ANGLE], &angle_pid_state);
+        }
 
-        if (sin_pitch < (target_angle - FLT_TO_Q16(HIGH_PID_LIMIT)))
-        {
-          motor_speed = -Q16_ONE;
-        }
-        else if (sin_pitch > target_angle + FLT_TO_Q16(HIGH_PID_LIMIT))
-        {
-          motor_speed = Q16_ONE;
-        }
-        else
-        {
-          motor_speed = pid_compute(sin_pitch, target_angle,
-              &pid_settings_arr[ANGLE], &angle_pid_state);
-        }
-        xSemaphoreGive(pid_mutex);
-
-        if (motor_speed < FLT_TO_Q16(MOTOR_DEADBAND) &&
-            motor_speed > -FLT_TO_Q16(MOTOR_DEADBAND))
-        {
+        if (abs(motor_speed) < FLT_TO_Q16(MOTOR_DEADBAND))
           motor_speed = 0;
-        }
 
         if (my_state == WOUND_UP)
-        {
           set_motors(0, 0);
-        }
         else
-        {
-          set_motors(motor_speed + steering_bias,
-              motor_speed - steering_bias);
-        }
+          set_motors(motor_speed + motor_bias,
+              motor_speed - motor_bias);
 
         if (motor_speed != Q16_ONE && motor_speed != -Q16_ONE)
-        {
           last_wind_up = current_time;
-        }
         else if (current_time - last_wind_up > WINDUP_TIMEOUT_US)
         {
           my_state = WOUND_UP;
@@ -193,22 +207,20 @@ static void main_loop(void *pvParameters)
         my_state = FALLEN;
         set_both_eyes(BLUE);
         travel_speed = 0;
+        smoothed_target_speed = 0;
         set_motors(0, 0);
       }
     }
-    else if (my_state == FALLEN)
+    else if (my_state == FALLEN &&
+      abs(sin_pitch - STABLE_ANGLE) < RECOVER_LIMIT &&
+      abs(sin_roll) < ROLL_LIMIT)
     {
-      if (sin_pitch < RECOVER_UPPER_BOUND &&
-          sin_pitch > RECOVER_LOWER_BOUND &&
-          sin_roll < ROLL_UPPER_BOUND && sin_roll > ROLL_LOWER_BOUND)
-      {
-        my_state = RUNNING;
-        last_wind_up = current_time;
-        set_both_eyes(GREEN);
-        pid_reset(sin_pitch, 0, &pid_settings_arr[ANGLE], &angle_pid_state);
-        pid_reset(0, FLT_TO_Q16(STABLE_ANGLE), &pid_settings_arr[VEL],
-            &vel_pid_state);
-      }
+      my_state = RUNNING;
+      last_wind_up = current_time;
+      set_both_eyes(GREEN);
+      pid_reset(sin_pitch, 0, &pid_settings_arr[ANGLE], &angle_pid_state);
+      pid_reset(0, FLT_TO_Q16(STABLE_ANGLE), &pid_settings_arr[VEL],
+          &vel_pid_state);
     }
 
     if (LOGMODE == LOG_FREQ)
@@ -240,34 +252,27 @@ static void main_loop(void *pvParameters)
 static void imu_interrupt_handler(uint8_t gpio_num)
 {
   BaseType_t xHigherPriorityTaskHasWoken = pdFALSE;
-  xTaskNotifyFromISR(xCalculationTask, 0, eNoAction, &xHigherPriorityTaskHasWoken);
+  if (xCalculationTask) xTaskNotifyFromISR(xCalculationTask, 0, eNoAction, &xHigherPriorityTaskHasWoken);
   portEND_SWITCHING_ISR(xHigherPriorityTaskHasWoken);
 }
 
 static void steering_watcher(void *arg)
 {
   for (;;)
-  {
     if (!xTaskNotifyWait(0, 0, NULL, STEERING_TIMEOUT_MS / portTICK_PERIOD_MS))
     {
       steering_bias = 0;
       target_speed = 0;
     }
-  }
 }
 
 static void imu_watcher(void *arg)
 {
-  for (;;)
-  {
-    if (!xTaskNotifyWait(0, 0, NULL, IMU_TIMEOUT_MS / portTICK_PERIOD_MS))
-    {
-      abort();
-    }
-  }
+  for (;;) if (!xTaskNotifyWait(0, 0, NULL, IMU_TIMEOUT_MS / portTICK_PERIOD_MS))
+    abort();
 }
 
-static void IRAM espway_exception_handler(void)
+static void IRAM espway_exception_handler()
 {
   _xt_isr_mask(BIT(INUM_TIMER_FRC1));  // Shut down the timer driving the motors
   // Make sure that the motor outputs are enabled as outputs and drive them low
@@ -278,7 +283,7 @@ static void IRAM espway_exception_handler(void)
   }
 }
 
-static void wifi_setup(void)
+static void wifi_setup()
 {
   sdk_wifi_set_opmode(SOFTAP_MODE);
   struct ip_info ap_ip;
@@ -301,7 +306,7 @@ static void wifi_setup(void)
   dhcpserver_start(&first_client_ip, 1);
 }
 
-void user_init(void)
+extern "C" void user_init(void)
 {
   set_user_exception_handler(espway_exception_handler);
   sdk_system_update_cpu_freq(SYS_CPU_160MHZ);
@@ -310,16 +315,15 @@ void user_init(void)
   imu_i2c_configure(I2C_FREQ_1300K, IMU_SCL_PIN, IMU_SDA_PIN);
   int ret = imu_init();
   if (ret != 0)
-  {
     printf("IMU init failed with code %d\n", ret);
-  }
   eyes_init();
   set_both_eyes(ret == 0 ? YELLOW : RED);
 
   pid_mutex = xSemaphoreCreateMutex();
   orientation_mutex = xSemaphoreCreateMutex();
+  steering_mutex = xSemaphoreCreateMutex();
 
-  motors_init(PWM_PERIOD);
+  motors_init();
 
   load_config();
   apply_config_params();
@@ -333,11 +337,12 @@ void user_init(void)
 
   wifi_setup();
 
-  xTaskCreate(&httpd_task, "HTTP Daemon", 128, NULL, PRIO_COMMUNICATION, NULL);
+  xTaskCreate(&httpd_task, "HTTP Daemon", 256, NULL, PRIO_COMMUNICATION, NULL);
   xTaskCreate(&main_loop, "Main loop", 256, NULL, PRIO_MAIN_LOOP, &xCalculationTask);
   xTaskCreate(&steering_watcher, "Steering watcher", 128, NULL, PRIO_MAIN_LOOP + 1, &xSteeringWatcher);
   xTaskCreate(&imu_watcher, "IMU watcher", 128, NULL, PRIO_MAIN_LOOP + 2, &xIMUWatcher);
+  xTaskCreate(&maze_solver_task, "Maze solver", 256, NULL, PRIO_COMMUNICATION + 1, NULL);
 
-  gpio_enable(4, GPIO_INPUT);
-  gpio_set_interrupt(4, GPIO_INTTYPE_EDGE_POS, imu_interrupt_handler);
+  gpio_enable(IMU_INTERRUPT_PIN, GPIO_INPUT);
+  gpio_set_interrupt(IMU_INTERRUPT_PIN, GPIO_INTTYPE_EDGE_POS, imu_interrupt_handler);
 }

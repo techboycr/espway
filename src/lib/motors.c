@@ -29,19 +29,9 @@ void set_motor_speed(int channel, int dir_pin, q16 speed, bool reverse)
   static const int32_t period = DS_RANGE;
   speed = Q16_TO_INT(period * speed);
 
-  if (speed > period)
-  {
-    speed = period;
-  }
-  else if (speed < -period)
-  {
-    speed = -period;
-  }
-
-  if (reverse)
-  {
-    speed = -speed;
-  }
+  if (speed > period) speed = period;
+  else if (speed < -period) speed = -period;
+  if (reverse) speed = -speed;
 
 #if MOTOR_DRIVER == MOTOR_DRIVER_L293D
 
@@ -67,7 +57,7 @@ void set_motors(q16 left_speed, q16 right_speed)
   set_motor_speed(1, MOTOR_LEFT_DIR_PIN, left_speed, REVERSE_LEFT_MOTOR);
 }
 
-void motors_init(int period)
+void motors_init(void)
 {
   // Motor direction pins
   gpio_enable(MOTOR_LEFT_DIR_PIN, GPIO_OUTPUT);

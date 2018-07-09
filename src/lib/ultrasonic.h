@@ -1,6 +1,6 @@
 /*
- * Library for calculating orientation from an inertial measurement unit
- * Copyright (C) 2017  Sakari Kapanen
+ * Ultrasonic sensor driver for esp-open-rtos
+ * Copyright (C) 2018  Sakari Kapanen
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -19,28 +19,20 @@
 #pragma once
 
 #include <stdint.h>
-#include "q16.h"
+#include <stdbool.h>
+#include <FreeRTOS.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "vector3d.h"
-
-typedef struct {
-  q16 Kp;
-  q16 Ki;
-  q16 dt;
-  vector3d_fix integral;
-  q16 gyro_conversion_factor;
-} mahony_filter_state;
-
-void mahony_filter_init(mahony_filter_state *state, float Kp, float Ki,
-    float gyro_factor, float dt);
-
-void mahony_filter_update(mahony_filter_state *params,
-    const int16_t *raw_accel, const int16_t *raw_gyro, vector3d_fix *gravity);
-
-#ifdef __cplusplus
-}
+#ifndef ULTRASONIC_SENSOR_MAX_COUNT
+#define ULTRASONIC_SENSOR_MAX_COUNT 2
 #endif
 
+#ifndef ULTRASONIC_SENSOR_MAX_TIME_MS
+#define ULTRASONIC_SENSOR_MAX_TIME_MS 20
+#endif
+
+#define CM_TO_US(cm) ((cm) * 58)
+
+// Add an ultrasonic sensor on the given pin
+void ultrasonic_sensor_init(uint8_t pins[], uint8_t n_pins);
+// Read the given ultrasonic sensor. Blocks execution
+int ultrasonic_sensor_read(uint8_t sensor_index);

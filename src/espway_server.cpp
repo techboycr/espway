@@ -16,27 +16,24 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+extern "C" {
 #include <string.h>
 #include <espressif/esp_common.h>
+}
 #include <lwip/altcp.h>
 #include <lwip/tcpip.h>
 #include <lwip/apps/httpd.h>
 
+#include "lib/locks.h"
 #include "espway.h"
-
-#define BATTERY_COEFFICIENT FLT_TO_Q16(100.0f / BATTERY_CALIBRATION_FACTOR)
 
 static void httpd_websocket_save_config(struct altcp_pcb *pcb)
 {
   uint8_t response;
   if (save_flash_config())
-  {
     response = RES_SAVE_CONFIG_SUCCESS;
-  }
   else
-  {
     response = RES_SAVE_CONFIG_FAILURE;
-  }
   httpd_websocket_write(pcb, &response, 1, WS_BIN_MODE);
 }
 
@@ -64,24 +61,23 @@ static void send_pid_params(struct altcp_pcb *pcb, pid_controller_index idx)
   buf[0] = RES_PID_PARAMS;
   buf[1] = idx;
   int32_t *params = (int32_t *)(&buf[2]);
-  xSemaphoreTake(pid_mutex, portMAX_DELAY);
-  params[0] = my_config.pid_coeffs_arr[idx].p;
-  params[1] = my_config.pid_coeffs_arr[idx].i;
-  params[2] = my_config.pid_coeffs_arr[idx].d;
-  xSemaphoreGive(pid_mutex);
+  {
+    MutexLock lock(pid_mutex);
+    params[0] = my_config.pid_coeffs_arr[idx].p;
+    params[1] = my_config.pid_coeffs_arr[idx].i;
+    params[2] = my_config.pid_coeffs_arr[idx].d;
+  }
   httpd_websocket_write(pcb, buf, sizeof(buf), WS_BIN_MODE);
 }
 
-static void send_gravity(struct altcp_pcb *pcb, const vector3d_fix * const grav)
+static void send_orientation(struct altcp_pcb *pcb)
 {
-  uint8_t buf[7];
-  buf[0] = RES_GRAVITY;
+  uint8_t buf[5];
+  buf[0] = RES_ORIENTATION;
   int16_t *qdata = (int16_t *)&buf[1];
-  xSemaphoreTake(orientation_mutex, portMAX_DELAY);
-  qdata[0] = grav->x / 2;
-  qdata[1] = grav->y / 2;
-  qdata[2] = grav->z / 2;
-  xSemaphoreGive(orientation_mutex);
+  orientation my_orientation = get_orientation();
+  qdata[0] = my_orientation.sin_pitch / 2;
+  qdata[1] = my_orientation.sin_roll / 2;
   httpd_websocket_write(pcb, buf, sizeof(buf), WS_BIN_MODE);
 }
 
@@ -104,14 +100,13 @@ static void httpd_websocket_cb(struct altcp_pcb *pcb, uint8_t *data,
       // Parameters: velocity (int8_t), turn rate (int8_t)
       if (data_len != 2) break;
       signed_data = (int8_t *)payload;
-      steering_bias = (FLT_TO_Q16(STEERING_FACTOR) * signed_data[0]) / 128;
-      target_speed = (FLT_TO_Q16(SPEED_CONTROL_FACTOR) * signed_data[1]) / 128;
-      xTaskNotify(xSteeringWatcher, 0, eNoAction);
+      set_steering((FLT_TO_Q16(SPEED_CONTROL_FACTOR) * signed_data[1]) / 128,
+        (FLT_TO_Q16(STEERING_FACTOR) * signed_data[0]) / 128);
       break;
 
-    case REQ_GRAVITY:
+    case REQ_ORIENTATION:
       if (data_len != 0) break;
-      send_gravity(pcb, &gravity);
+      send_orientation(pcb);
       break;
 
     case REQ_SET_PID_PARAMS:
@@ -159,27 +154,26 @@ static void httpd_websocket_cb(struct altcp_pcb *pcb, uint8_t *data,
 
 static void battery_task(void *pvParameter)
 {
-  q16 battery_value = 0;
+  uint32_t battery_value = 0;
   for (;;)
   {
     battery_value = q16_exponential_smooth(battery_value, sdk_system_adc_read(),
         FLT_TO_Q16(0.25f));
+    uint32_t battery_mv = (battery_value * BATTERY_FULL_SCALE_RANGE) / 1024;
 
-    if (ENABLE_BATTERY_CUTOFF &&
-        battery_value < (unsigned int)(BATTERY_THRESHOLD * BATTERY_CALIBRATION_FACTOR))
+    if (ENABLE_BATTERY_CUTOFF && battery_mv < BATTERY_THRESHOLD)
     {
       battery_cutoff();
       break;
     }
 
     {
-      LOCK_TCPIP_CORE();
+      LwipCoreLock lock();
       uint8_t buf[3];
       buf[0] = BATTERY;
       uint16_t *payload = (uint16_t *)&buf[1];
-      payload[0] = q16_mul(battery_value, BATTERY_COEFFICIENT);
+      payload[0] = battery_mv;
       httpd_websocket_broadcast(buf, sizeof(buf), WS_BIN_MODE);
-      UNLOCK_TCPIP_CORE();
     }
 
     vTaskDelay(BATTERY_CHECK_INTERVAL / portTICK_PERIOD_MS);
@@ -188,17 +182,12 @@ static void battery_task(void *pvParameter)
   vTaskDelete(NULL);
 }
 
-const char *pid_handler(int iIndex, int iNumParams, char* pvParams[], char* pvValues[])
-{
-  return "/pid.html";
-}
-
 void httpd_task(void *pvParameters)
 {
   xTaskCreate(battery_task, "Battery task", 256, NULL, uxTaskPriorityGet(NULL), NULL);
 
   tCGI pCGIs[] = {
-    {"/pid", pid_handler }
+    {"/pid", [](int, int, char*[], char*[]) { return "/pid.html"; }}
   };
   http_set_cgi_handlers(pCGIs, sizeof (pCGIs) / sizeof (pCGIs[0]));
 

@@ -1,6 +1,6 @@
 /*
- * Library for calculating orientation from an inertial measurement unit
- * Copyright (C) 2017  Sakari Kapanen
+ * lwIP and FreeRTOS RAII lock helpers
+ * Copyright (C) 2018  Sakari Kapanen
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -18,29 +18,37 @@
 
 #pragma once
 
-#include <stdint.h>
-#include "q16.h"
+#include <FreeRTOS.h>
+#include <semphr.h>
+#include <lwip/tcpip.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "vector3d.h"
+struct MutexLock
+{
+  MutexLock(SemaphoreHandle_t handle)
+  {
+    xSemaphoreTake(handle, portMAX_DELAY);
+    m_handle = handle;
+  }
 
-typedef struct {
-  q16 Kp;
-  q16 Ki;
-  q16 dt;
-  vector3d_fix integral;
-  q16 gyro_conversion_factor;
-} mahony_filter_state;
+  ~MutexLock()
+  {
+    xSemaphoreGive(m_handle);
+  }
 
-void mahony_filter_init(mahony_filter_state *state, float Kp, float Ki,
-    float gyro_factor, float dt);
+  private:
+    SemaphoreHandle_t m_handle;
+};
 
-void mahony_filter_update(mahony_filter_state *params,
-    const int16_t *raw_accel, const int16_t *raw_gyro, vector3d_fix *gravity);
+struct LwipCoreLock
+{
+  LwipCoreLock()
+  {
+    LOCK_TCPIP_CORE();
+  }
 
-#ifdef __cplusplus
-}
-#endif
+  ~LwipCoreLock()
+  {
+    UNLOCK_TCPIP_CORE();
+  }
+};
 
